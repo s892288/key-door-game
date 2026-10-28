@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>拿鑰匙開門 - 隨機關卡挑戰</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #14141f;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    height: 100%;
+    font-family: "Microsoft JhengHei", sans-serif;
+  }
+  #game-container {
+    box-shadow: 0 0 30px rgba(0,0,0,0.6);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  #hint {
+    color: #999;
+    margin-top: 10px;
+    font-size: 14px;
+    text-align: center;
+    max-width: 800px;
+  }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/phaser/3.70.0/phaser.min.js"></script>
+</head>
+<body>
+<div id="game-container"></div>
+<div id="hint">方向鍵移動　|　R 重新挑戰本關(會重新隨機一次)　|　撿到鑰匙後要走到「同色的門」前才會自動開門,全部門都打開才算過關　|　紅色是巡邏怪,碰牆折返、速率路線會隨機變化　|　紫色是追蹤怪,四周有可見的偵測圈,玩家進圈會被直接追上,離開圈才會停止　|　全破 4 關會依「總用時」記錄到本機排行榜</div>
+
+<script>
+const WIDTH = 800;
+const HEIGHT = 600;
+const KEY_COLORS = [0xffd54f, 0x4dd0e1, 0xff77aa, 0x9ccc65, 0xba68c8];
+const LEADERBOARD_KEY = 'keyDoorGame_bestTimes_v1';
+
+let currentLevelIndex = 0;
+let runStartTime = null;       // 這次「從第1關到全破」的起始時間 (Date.now())
+let memoryLeaderboardFallback = []; // localStorage 不可用時的備援儲存
+
+/* =========================================================
+   排行榜: 優先用 localStorage 永久保存,不可用時自動退回記憶體暫存
+========================================================= */
+function isLocalStorageAvailable() {
+  try {
+    const testKey = '__kd_test__';
+    localStorage.setItem(testKey, '1');
+    localStorage.removeItem(testKey);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function loadLeaderboard() {
+  if (isLocalStorageAvailable()) {
+    try {
+      const raw = localStorage.getItem(LEADERBOARD_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+      return [];
+    }
+  }
+  return memoryLeaderboardFallback.slice();
+}
+
+function saveLeaderboard(list) {
+  if (isLocalStorageAvailable()) {
+    try {
+      localStorage.setItem(LEADERBOARD_KEY, JSON.stringify(list));
+      return;
+    } catch (e) {
+      // 寫入失敗就一起退回記憶體備援
+    }
+  }
+  memoryLeaderboardFallback = list.slice();
+}
+
+// 新增一筆成績,回傳更新後的前10名清單與這筆成績的名次
+function addScore(timeMs) {
+  const list = loadLeaderboard();
+  const entry = { timeMs, date: new Date().toLocaleString('zh-TW', { hour12: false }) };
+  list.push(entry);
+  list.sort((a, b) => a.timeMs - b.timeMs);
+  const top = list.slice(0, 10);
+  saveLeaderboard(top);
+  const rank = top.findIndex(e => e === entry) + 1; // 0 表示被擠出前10名
+  return { top, rank };
+}
+
+function clearLeaderboard() {
+  saveLeaderboard([]);
+}
+
+function formatTime(ms) {
+  const totalMs = Math.max(0, Math.round(ms));
+  const m = Math.floor(totalMs / 60000);
+  const s = Math.floor((totalMs % 60000) / 1000);
+  const tenths = Math.floor((totalMs % 1000) / 100);
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${tenths}`;
+}
+
+/* =========================================================
+   難度設定 - 每關的「數量與時限」固定,但「位置」每次都隨機產生
+   想調難度直接改這裡的數字
+========================================================= */
+const LEVEL_CONFIGS = [
+  { name: '第 1 關 - 新手教學', numKeys: 1, numEnemies: 0, numTraps: 0, numObstacles: 1, timeLimit: 40 },
+  { name: '第 2 關 - 雙鑰匙',    numKeys: 2, numEnemies: 1, numTraps: 0, numObstacles: 2, timeLimit: 45 },
+  { name: '第 3 關 - 三鑰匙迷宮', numKeys: 3, numEnemies: 2, numTraps: 2, numObstacles: 3, timeLimit: 55 },
+  { name: '第 4 關 - 終極挑戰',  numKeys: 3, numEnemies: 3, numTraps: 3, numObstacles: 4, timeLimit: 65 }
+];
+
+/* =========================================================
+   隨機關卡產生器
+   每次呼叫都會回傳一份全新、亂數排列的關卡資料
+========================================================= */
+function generateLevel(levelIndex) {
+  const cfg = LEVEL_CONFIGS[levelIndex];
+  const bounds = { xMin: 70, xMax: WIDTH - 70, yMin: 70, yMax: HEIGHT - 70 };
+  const obstacles = [];
+  const placed = []; // 已放置的點,用來避免物件互相重疊太近
+
+  function randInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  function overlapsObstacle(x, y, margin) {
+    return obstacles.some(o =>
+      x > o.x - o.w / 2 - margin && x < o.x + o.w / 2 + margin &&
+      y > o.y - o.h / 2 - margin && y < o.y + o.h / 2 + margin
+    );
+  }
+
+  function tooClose(x, y, minDist) {
+    return placed.some(p => Phaser.Math.Distance.Between(x, y, p.x, p.y) < minDist);
+  }
+
+  function randomFreePoint(minDist, margin) {
+    for (let i = 0; i < 300; i++) {
+      const x = randInt(bounds.xMin, bounds.xMax);
+      const y = randInt(bounds.yMin, bounds.yMax);
+      if (!overlapsObstacle(x, y, margin) && !tooClose(x, y, minDist)) return { x, y };
+    }
+    // 300 次都找不到理想位置就退而求其次,避免卡死
+    return { x: randInt(bounds.xMin, bounds.xMax), y: randInt(bounds.yMin, bounds.yMax) };
+  }
+
+  // ---- 障礙物: 長度有上限,確保一定留有可繞過的空隙 ----
+  for (let i = 0; i < cfg.numObstacles; i++) {
+    const vertical = Math.random() < 0.5;
+    const length = randInt(160, 240);
+    const thickness = 20;
+    let ox, oy, ow, oh;
+    if (vertical) {
+      ow = thickness; oh = length;
+      ox = randInt(160, WIDTH - 160);
+      oy = randInt(100 + length / 2, HEIGHT - 100 - length / 2);
+    } else {
+      ow = length; oh = thickness;
+      oy = randInt(160, HEIGHT - 160);
+      ox = randInt(100 + length / 2, WIDTH - 100 - length / 2);
+    }
+    let tries = 0;
+    while (obstacles.some(o => Math.abs(o.x - ox) < 90 && Math.abs(o.y - oy) < 90) && tries < 60) {
+      if (vertical) { ox = randInt(160, WIDTH - 160); oy = randInt(100 + length / 2, HEIGHT - 100 - length / 2); }
+      else { oy = randInt(160, HEIGHT - 160); ox = randInt(100 + length / 2, WIDTH - 100 - length / 2); }
+      tries++;
+    }
+    obstacles.push({ x: ox, y: oy, w: ow, h: oh });
+  }
+
+  // ---- 玩家起始點: 固定在左上角附近,若剛好卡到障礙物就換左下角 ----
+  let playerStart = { x: 80, y: 80 };
+  if (overlapsObstacle(playerStart.x, playerStart.y, 60)) {
+    playerStart = { x: 80, y: HEIGHT - 80 };
+  }
+  placed.push(playerStart);
+
+  // ---- 鑰匙 / 門配對 ----
+  const keysDoors = [];
+  for (let i = 0; i < cfg.numKeys; i++) {
+    const keyPos = randomFreePoint(80, 40);
+    placed.push(keyPos);
+    const doorPos = randomFreePoint(90, 40);
+    placed.push(doorPos);
+    const orientation = Math.random() < 0.5 ? 'v' : 'h';
+    keysDoors.push({ id: i, color: KEY_COLORS[i % KEY_COLORS.length], keyPos, doorPos, orientation });
+  }
+
+  // ---- 敵人: 出生點在鑰匙「附近」的隨機偏移位置(不會跟鑰匙同一條水平/垂直線),
+  //      但距離夠近,巡邏時仍會掃過鑰匙周邊,逼玩家抓空檔衝進去撿
+  const enemies = [];
+  for (let i = 0; i < cfg.numEnemies && keysDoors.length > 0; i++) {
+    const guardedKey = keysDoors[i % keysDoors.length];
+
+    let pos = null;
+    for (let t = 0; t < 40; t++) {
+      const angle = Math.random() * Math.PI * 2;
+      const dist = randInt(45, 85);
+      const cx = Phaser.Math.Clamp(guardedKey.keyPos.x + Math.cos(angle) * dist, bounds.xMin, bounds.xMax);
+      const cy = Phaser.Math.Clamp(guardedKey.keyPos.y + Math.sin(angle) * dist, bounds.yMin, bounds.yMax);
+      if (!overlapsObstacle(cx, cy, 30)) { pos = { x: cx, y: cy }; break; }
+    }
+    if (!pos) pos = { x: guardedKey.keyPos.x, y: guardedKey.keyPos.y }; // 找不到理想偏移點就退而求其次
+
+    const axis = Math.random() < 0.5 ? 'x' : 'y';
+    const speed = randInt(110, 150) + levelIndex * 15;
+    // 關卡越後面,出現追蹤型敵人的機率越高
+    const chaserChance = Math.min(0.15 + levelIndex * 0.15, 0.6);
+    const type = Math.random() < chaserChance ? 'chaser' : 'patrol';
+    enemies.push({ x: pos.x, y: pos.y, axis, speed, guardKeyId: guardedKey.id, type });
+  }
+
+  // ---- 陷阱 ----
+  const traps = [];
+  for (let i = 0; i < cfg.numTraps; i++) {
+    const pos = randomFreePoint(70, 40);
+    placed.push(pos);
+    traps.push({ x: pos.x, y: pos.y, w: 36, h: 36 });
+  }
+
+  return {
+    name: cfg.name,
+    obstacles,
+    keysDoors,
+    enemies,
+    traps,
+    timeLimit: cfg.timeLimit,
+    playerStart
+  };
+}
+
+class MainScene extends Phaser.Scene {
+  constructor() {
+    super('MainScene');
+  }
+
+  create() {
+    const level = generateLevel(currentLevelIndex);
+    this.level = level;
+    this.levelEnded = false;
+    this.openedCount = 0;
+    this.inventory = new Set(); // 玩家目前手上持有、尚未使用的鑰匙 id
+    this.doors = [];
+    this.usingFallbackStorage = !isLocalStorageAvailable();
+
+    // 每次回到第 1 關,代表一輪新的計時挑戰開始
+    if (currentLevelIndex === 0) {
+      runStartTime = Date.now();
+    }
+
+    // 背景
+    this.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x22223a);
+
+    // 外牆
+    const wallsGroup = this.physics.add.staticGroup();
+    const wt = 20;
+    [
+      [WIDTH / 2, wt / 2, WIDTH, wt],
+      [WIDTH / 2, HEIGHT - wt / 2, WIDTH, wt],
+      [wt / 2, HEIGHT / 2, wt, HEIGHT],
+      [WIDTH - wt / 2, HEIGHT / 2, wt, HEIGHT]
+    ].forEach(([x, y, w, h]) => {
+      const r = this.add.rectangle(x, y, w, h, 0x55557a);
+      this.physics.add.existing(r, true);
+      wallsGroup.add(r);
+    });
+
+    // 關卡障礙物
+    const obstacles = this.physics.add.staticGroup();
+    level.obstacles.forEach(o => {
+      const r = this.add.rectangle(o.x, o.y, o.w, o.h, 0x44445e);
+      this.physics.add.existing(r, true);
+      obstacles.add(r);
+    });
+
+    // 陷阱 (靜態,碰到直接失敗)
+    const trapsGroup = this.physics.add.staticGroup();
+    level.traps.forEach(t => {
+      const r = this.add.rectangle(t.x, t.y, t.w, t.h, 0xff6d00);
+      r.setStrokeStyle(2, 0xffab40);
+      const g = this.add.graphics();
+      g.lineStyle(2, 0x3e2723);
+      for (let i = -t.w / 2; i < t.w / 2; i += 8) {
+        g.beginPath();
+        g.moveTo(t.x + i, t.y - t.h / 2);
+        g.lineTo(t.x + i + 4, t.y + t.h / 2);
+        g.strokePath();
+      }
+      this.physics.add.existing(r, true);
+      trapsGroup.add(r);
+    });
+
+    // 玩家
+    this.player = this.add.rectangle(level.playerStart.x, level.playerStart.y, 30, 30, 0x4dd0e1);
+    this.player.setStrokeStyle(2, 0xffffff);
+    this.physics.add.existing(this.player);
+    this.player.body.setCollideWorldBounds(true);
+    this.player.body.setSize(30, 30);
+
+    // 門 + 開門偵測用的較大感應區
+    level.keysDoors.forEach(pair => {
+      const dw = pair.orientation === 'v' ? 20 : 100;
+      const dh = pair.orientation === 'v' ? 100 : 20;
+
+      const door = this.add.rectangle(pair.doorPos.x, pair.doorPos.y, dw, dh, pair.color);
+      door.setStrokeStyle(4, 0xff5252);
+      door.setAlpha(0.9);
+      this.physics.add.existing(door, true);
+      door.doorId = pair.id;
+      door.locked = true;
+      this.physics.add.collider(this.player, door);
+      this.doors.push(door);
+
+      // 感應區比門本體大一圈,確保玩家一靠近就能觸發「用鑰匙開門」判定
+      const zone = this.add.zone(pair.doorPos.x, pair.doorPos.y, dw + 34, dh + 34);
+      this.physics.add.existing(zone, true);
+      zone.doorId = pair.id;
+      this.physics.add.overlap(this.player, zone, this.tryOpenDoor, null, this);
+    });
+
+    // 鑰匙
+    this.keys = [];
+    level.keysDoors.forEach(pair => {
+      const container = this.add.container(pair.keyPos.x, pair.keyPos.y);
+      const head = this.add.circle(0, 0, 9, pair.color);
+      const shaft = this.add.rectangle(13, 0, 18, 5, pair.color);
+      head.setStrokeStyle(1, 0xffffff);
+      container.add([head, shaft]);
+      this.physics.add.existing(container);
+      container.body.setSize(32, 18);
+      container.keyId = pair.id;
+      this.keys.push(container);
+      this.physics.add.overlap(this.player, container, this.collectKey, null, this);
+    });
+
+    // 敵人平均速度隨關卡提升,範圍越大代表節奏越難預測
+    this.enemySpeedRange = { min: 90 + currentLevelIndex * 10, max: 170 + currentLevelIndex * 25 };
+    const ENEMY_SIZE = 26;
+    const CHASER_DETECTION_RADIUS = ENEMY_SIZE * 4; // 偵測範圍半徑 = 敵人本體大小的 4 倍
+
+    // 敵人 (巡邏: 碰到牆或障礙物會物理彈回,並且會定時/碰撞時隨機改變路線與速率)
+    // 追蹤型 (chaser): 平常也是巡邏,但玩家一進入牠周圍可見的偵測圈就會直接衝過來
+    this.enemies = [];
+    level.enemies.forEach(e => {
+      const isChaser = e.type === 'chaser';
+      const color = isChaser ? 0xab47bc : 0xef5350;
+      const strokeColor = isChaser ? 0xe1bee7 : 0xffcdd2;
+
+      // 追蹤型敵人先畫出偵測範圍圓圈(在敵人本體底下),讓玩家看得到危險區域
+      let rangeCircle = null;
+      if (isChaser) {
+        rangeCircle = this.add.circle(e.x, e.y, CHASER_DETECTION_RADIUS, 0xab47bc, 0.07);
+        rangeCircle.setStrokeStyle(2, 0xab47bc, 0.5);
+        rangeCircle.setDepth(3);
+      }
+
+      const enemy = this.add.rectangle(e.x, e.y, ENEMY_SIZE, ENEMY_SIZE, color);
+      enemy.setStrokeStyle(2, strokeColor);
+      enemy.setDepth(6);
+      this.physics.add.existing(enemy);
+      enemy.body.setCollideWorldBounds(true);
+      enemy.body.setBounce(1, 1); // 碰牆自動原地折返
+      enemy.currentAxis = e.axis;
+      enemy.nextChangeAt = Phaser.Math.Between(1200, 2600); // 錯開每隻怪第一次改變路線的時間
+      enemy.type = e.type;
+      enemy.chasing = false;
+      enemy.rangeCircle = rangeCircle;
+      enemy.detectionRadius = CHASER_DETECTION_RADIUS;
+      enemy.chaseSpeed = e.speed + 30;
+
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      if (e.axis === 'x') enemy.body.setVelocityX(e.speed * dir);
+      else enemy.body.setVelocityY(e.speed * dir);
+
+      this.enemies.push(enemy);
+      this.physics.add.overlap(this.player, enemy, () => this.failLevel(isChaser ? '被追上了!' : '被敵人抓到了!'), null, this);
+    });
+
+    // 碰撞: 牆壁 / 障礙物
+    this.physics.add.collider(this.player, wallsGroup);
+    this.physics.add.collider(this.player, obstacles);
+    this.enemies.forEach(en => {
+      this.physics.add.collider(en, wallsGroup, () => this.randomizeEnemySpeed(en), null, this);
+      this.physics.add.collider(en, obstacles, () => this.randomizeEnemySpeed(en), null, this);
+    });
+
+    // 陷阱碰撞 -> 失敗
+    this.physics.add.overlap(this.player, trapsGroup, () => this.failLevel('踩到陷阱了!'), null, this);
+
+    // 控制
+    this.cursors = this.input.keyboard.createCursorKeys();
+    this.keyR = this.input.keyboard.addKey('R');
+
+    // HUD
+    this.hudText = this.add.text(16, 12, '', {
+      fontSize: '17px',
+      fill: '#ffffff',
+      lineSpacing: 6
+    }).setDepth(20);
+
+    this.timeLeft = level.timeLimit;
+    this.updateHud();
+
+    this.timerEvent = this.time.addEvent({
+      delay: 1000,
+      loop: true,
+      callback: () => {
+        if (this.levelEnded) return;
+        this.timeLeft--;
+        this.updateHud();
+        if (this.timeLeft <= 0) this.failLevel('時間到了!');
+      }
+    });
+
+    // 中央訊息文字
+    this.messageText = this.add.text(WIDTH / 2, HEIGHT / 2, '', {
+      fontSize: '40px',
+      fill: '#ffeb3b',
+      fontStyle: 'bold',
+      align: 'center'
+    }).setOrigin(0.5).setDepth(30).setVisible(false);
+
+    // 關卡開場提示
+    const introText = this.add.text(WIDTH / 2, 60, level.name, {
+      fontSize: '26px',
+      fill: '#ffffff',
+      fontStyle: 'bold'
+    }).setOrigin(0.5).setDepth(20).setAlpha(0);
+    this.tweens.add({ targets: introText, alpha: 1, duration: 400, yoyo: true, hold: 900, onComplete: () => introText.destroy() });
+
+    // 在第 1 關開場順便提示目前最佳全破紀錄,給玩家一個目標
+    if (currentLevelIndex === 0) {
+      const board = loadLeaderboard();
+      const bestLine = board.length > 0
+        ? `👑 目前最佳全破紀錄: ${formatTime(board[0].timeMs)}`
+        : '👑 目前還沒有人全破,當第一個吧!';
+      const storageNote = this.usingFallbackStorage
+        ? '\n⚠️ 目前環境無法永久保存紀錄,重新整理頁面會清空(下載到本機開啟則可永久保存)'
+        : '';
+      const bestText = this.add.text(WIDTH / 2, HEIGHT - 24, bestLine + storageNote, {
+        fontSize: '13px',
+        fill: '#bdbdbd',
+        align: 'center'
+      }).setOrigin(0.5).setDepth(20);
+      this.tweens.add({ targets: bestText, alpha: 0, duration: 500, delay: 2500 });
+    }
+  }
+
+  update() {
+    if (this.levelEnded) return;
+
+    const speed = 220;
+    this.player.body.setVelocity(0);
+    if (this.cursors.left.isDown) this.player.body.setVelocityX(-speed);
+    else if (this.cursors.right.isDown) this.player.body.setVelocityX(speed);
+    if (this.cursors.up.isDown) this.player.body.setVelocityY(-speed);
+    else if (this.cursors.down.isDown) this.player.body.setVelocityY(speed);
+
+    // 鑰匙浮動動畫
+    this.keys.forEach(k => {
+      if (k.active) k.y += Math.sin(this.time.now / 200 + k.x) * 0.3;
+    });
+
+    // 敵人巡邏 / 追蹤邏輯
+    this.enemies.forEach(en => {
+      if (en.type === 'chaser') {
+        en.rangeCircle.setPosition(en.x, en.y); // 偵測圈跟著敵人移動
+
+        const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, en.x, en.y);
+        if (dist <= en.detectionRadius) {
+          // 玩家在偵測範圍內 -> 直接朝玩家衝過去
+          en.chasing = true;
+          const angle = Phaser.Math.Angle.Between(en.x, en.y, this.player.x, this.player.y);
+          en.body.setVelocity(Math.cos(angle) * en.chaseSpeed, Math.sin(angle) * en.chaseSpeed);
+        } else if (en.chasing) {
+          // 玩家剛離開偵測範圍 -> 停止追蹤,恢復隨機巡邏
+          en.chasing = false;
+          this.redirectEnemy(en);
+          en.nextChangeAt = this.time.now + Phaser.Math.Between(1500, 3000);
+        } else if (this.time.now > en.nextChangeAt) {
+          this.redirectEnemy(en);
+          en.nextChangeAt = this.time.now + Phaser.Math.Between(1500, 3000);
+        }
+      } else if (this.time.now > en.nextChangeAt) {
+        this.redirectEnemy(en);
+        en.nextChangeAt = this.time.now + Phaser.Math.Between(1500, 3000);
+      }
+    });
+
+    if (Phaser.Input.Keyboard.JustDown(this.keyR)) {
+      this.failLevel('重新挑戰!', true);
+    }
+  }
+
+  // 定時觸發: 有機率切換巡邏軸向(路線更改),並隨機給一個新速率
+  redirectEnemy(en) {
+    const changeAxis = Math.random() < 0.4;
+    const axis = changeAxis ? (en.currentAxis === 'x' ? 'y' : 'x') : en.currentAxis;
+    const dir = Math.random() < 0.5 ? 1 : -1;
+    const newSpeed = Phaser.Math.Between(this.enemySpeedRange.min, this.enemySpeedRange.max);
+    en.currentAxis = axis;
+    if (axis === 'x') en.body.setVelocity(newSpeed * dir, 0);
+    else en.body.setVelocity(0, newSpeed * dir);
+  }
+
+  // 碰牆/障礙物觸發: 保留物理彈跳的方向,只重新隨機一個速率,製造節奏變化
+  randomizeEnemySpeed(en) {
+    if (en.chasing) return; // 追擊中不要被隨機速率打斷方向
+    const vx = en.body.velocity.x;
+    const vy = en.body.velocity.y;
+    const newSpeed = Phaser.Math.Between(this.enemySpeedRange.min, this.enemySpeedRange.max);
+    if (Math.abs(vx) >= Math.abs(vy)) {
+      en.currentAxis = 'x';
+      en.body.setVelocity((Math.sign(vx) || 1) * newSpeed, 0);
+    } else {
+      en.currentAxis = 'y';
+      en.body.setVelocity(0, (Math.sign(vy) || 1) * newSpeed);
+    }
+  }
+
+  // 撿鑰匙: 只放進「手上鑰匙」的清單,不會自動開門
+  collectKey(player, keyObj) {
+    if (!keyObj.active) return;
+    const id = keyObj.keyId;
+    keyObj.destroy();
+    this.inventory.add(id);
+    this.updateHud();
+    // 撿到當下若剛好就站在對應門的感應區內,順便嘗試開門
+    this.doors.forEach(d => {
+      if (d.doorId === id && d.locked) {
+        const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, d.x, d.y);
+        if (dist < 100) this.openDoorById(id);
+      }
+    });
+  }
+
+  // 玩家走到門的感應區時呼叫: 有對應鑰匙才會開門
+  tryOpenDoor(player, zone) {
+    if (this.levelEnded) return;
+    this.openDoorById(zone.doorId);
+  }
+
+  openDoorById(doorId) {
+    if (!this.inventory.has(doorId)) return; // 手上沒有對應鑰匙,門不會開
+    const door = this.doors.find(d => d.doorId === doorId);
+    if (!door || !door.locked) return;
+
+    door.locked = false;
+    door.body.enable = false; // 解鎖後可通過
+    door.setStrokeStyle(4, 0x69f0ae);
+    door.setAlpha(0.35);
+    this.inventory.delete(doorId); // 鑰匙用掉了
+    this.openedCount++;
+    this.updateHud();
+
+    if (this.openedCount >= this.level.keysDoors.length) {
+      this.completeLevel();
+    }
+  }
+
+  completeLevel() {
+    if (this.levelEnded) return;
+    this.levelEnded = true;
+    this.timerEvent.remove();
+    this.player.body.setVelocity(0);
+
+    const isLast = currentLevelIndex >= LEVEL_CONFIGS.length - 1;
+    this.messageText.setText(isLast ? '🎉 全部過關!恭喜通關!' : '✅ 過關!前往下一關(隨機重新生成)...');
+    this.messageText.setFill(isLast ? '#69f0ae' : '#ffeb3b');
+    this.messageText.setVisible(true);
+
+    this.time.delayedCall(1200, () => {
+      if (isLast) {
+        this.showLeaderboardResult();
+      } else {
+        currentLevelIndex++;
+        this.scene.restart();
+      }
+    });
+  }
+
+  // 全破後: 計算總用時、寫入排行榜、顯示前幾名清單
+  showLeaderboardResult() {
+    const totalMs = Date.now() - runStartTime;
+    const { top, rank } = addScore(totalMs);
+    currentLevelIndex = 0; // 準備好下一輪重新開始
+
+    const rankLine = rank === 1
+      ? '🏆 新紀錄!目前排名第 1 名!'
+      : rank > 0
+        ? `👑 排行榜第 ${rank} 名`
+        : '完成了!(用時較長,未進前10名)';
+
+    this.messageText.setText(
+      `🎉 全部過關!\n⏱ 總用時: ${formatTime(totalMs)}\n${rankLine}\n\n按 R 重新開始`
+    );
+    this.messageText.setFill('#69f0ae');
+    this.messageText.setFontSize(28);
+    this.messageText.setY(HEIGHT / 2 - 90);
+
+    // 排行榜清單
+    const lines = top.length > 0
+      ? top.map((e, i) => `${i + 1}. ${formatTime(e.timeMs)}　${e.date}`).join('\n')
+      : '目前還沒有紀錄';
+    const storageNote = this.usingFallbackStorage
+      ? '\n\n⚠️ 目前環境無法永久保存,重新整理頁面會清空(下載到本機開啟則可永久保存)'
+      : '';
+
+    this.add.text(WIDTH / 2, HEIGHT / 2 + 90, `🏁 全破排行榜 (最短時間 Top ${top.length})\n` + lines + storageNote, {
+      fontSize: '15px',
+      fill: '#e0e0e0',
+      align: 'center',
+      lineSpacing: 4
+    }).setOrigin(0.5).setDepth(30);
+
+    this.input.keyboard.once('keydown-R', () => this.scene.restart());
+  }
+
+  failLevel(msg, manual = false) {
+    if (this.levelEnded) return;
+    this.levelEnded = true;
+    if (this.timerEvent) this.timerEvent.remove();
+    this.player.body.setVelocity(0);
+
+    this.messageText.setText((manual ? '🔄 ' : '💀 ') + msg + '\n(關卡即將重新隨機產生)');
+    this.messageText.setFill('#ff5252');
+    this.messageText.setVisible(true);
+
+    this.time.delayedCall(900, () => this.scene.restart());
+  }
+
+  updateHud() {
+    const level = this.level;
+    const mm = String(Math.floor(Math.max(this.timeLeft, 0) / 60)).padStart(2, '0');
+    const ss = String(Math.max(this.timeLeft, 0) % 60).padStart(2, '0');
+    const timeIcon = this.timeLeft <= 10 ? '⏰' : '⏳';
+    this.hudText.setText(
+      `關卡: ${currentLevelIndex + 1} / ${LEVEL_CONFIGS.length}\n` +
+      `已開門: ${this.openedCount} / ${level.keysDoors.length}\n` +
+      `手上鑰匙: ${this.inventory.size} 把\n` +
+      `${timeIcon} ${mm}:${ss}`
+    );
+    this.hudText.setColor(this.timeLeft <= 10 ? '#ff5252' : '#ffffff');
+  }
+}
+
+const config = {
+  type: Phaser.AUTO,
+  width: WIDTH,
+  height: HEIGHT,
+  parent: 'game-container',
+  backgroundColor: '#22223a',
+  physics: {
+    default: 'arcade',
+    arcade: {
+      gravity: { y: 0 },
+      debug: false
+    }
+  },
+  scene: MainScene
+};
+
+new Phaser.Game(config);
+</script>
+</body>
+</html>
